@@ -13,6 +13,7 @@
     --muted: #5B6B7D;
     --line: #DCE3EC;
     --card: #FFFFFF;
+    --warn: #B3261E;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { max-width: 100%; overflow-x: hidden; }
@@ -46,7 +47,7 @@
     display: flex; flex-wrap: wrap; gap: 4px 16px;
     font-size: .78rem; color: var(--muted); margin-bottom: 12px;
   }
-  .status .err { color: #B3261E; font-weight: 600; }
+  .status .err { color: var(--warn); font-weight: 600; }
 
   .cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
   @media (min-width: 720px) { .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
@@ -57,6 +58,7 @@
   .card .label { font-size: .72rem; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
   .card .value { font-size: 1.6rem; font-weight: 600; margin-top: 2px; white-space: nowrap; }
   .card .value.accent { color: var(--accent); }
+  .card .value.warn { color: var(--warn); }
   .card .unit { font-size: .9rem; color: var(--muted); font-weight: 400; }
 
   section.panel {
@@ -64,7 +66,7 @@
     padding: 14px; margin-top: 16px; min-width: 0;
   }
   h2 { font-size: .85rem; font-weight: 650; margin-bottom: 10px; }
-  .chart-wrap { position: relative; height: 240px; width: 100%; }
+  .chart-wrap { position: relative; height: 260px; width: 100%; }
 
   .table-wrap { width: 100%; overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: .85rem; }
@@ -91,22 +93,30 @@
 <main>
   <div class="status">
     <span id="statusText">Bağlanılıyor…</span>
-    <span class="num" id="lastUpdate">Son güncelleme: —</span>
+    <span class="num" id="rangeText"></span>
   </div>
 
   <div class="cards">
     <div class="card"><div class="label">Güncel Sıcaklık</div>
       <div class="value accent num"><span id="cur">—</span> <span class="unit">°C</span></div></div>
-    <div class="card"><div class="label">Minimum</div>
+    <div class="card"><div class="label">Güncel Nem</div>
+      <div class="value accent num"><span id="hcur">—</span> <span class="unit">%</span></div></div>
+    <div class="card"><div class="label">Min Sıcaklık</div>
       <div class="value num"><span id="min">—</span> <span class="unit">°C</span></div></div>
-    <div class="card"><div class="label">Maksimum</div>
+    <div class="card"><div class="label">Maks Sıcaklık</div>
       <div class="value num"><span id="max">—</span> <span class="unit">°C</span></div></div>
+    <div class="card"><div class="label">Min Nem</div>
+      <div class="value num"><span id="hmin">—</span> <span class="unit">%</span></div></div>
+    <div class="card"><div class="label">Maks Nem</div>
+      <div class="value num"><span id="hmax">—</span> <span class="unit">%</span></div></div>
     <div class="card"><div class="label">Toplam Örnek</div>
       <div class="value num"><span id="count">—</span></div></div>
+    <div class="card"><div class="label">Son Veri</div>
+      <div class="value num" id="ageBox"><span id="age">—</span> <span class="unit">önce</span></div></div>
   </div>
 
   <section class="panel">
-    <h2>Sıcaklık Akışı (°C)</h2>
+    <h2>Sıcaklık (°C) ve Nem (%) Akışı</h2>
     <div class="chart-wrap"><canvas id="chart"></canvas></div>
   </section>
 
@@ -114,8 +124,8 @@
     <h2>Canlı Veri Kaydı (Son 5)</h2>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>#</th><th>Zaman</th><th class="r">Sıcaklık (°C)</th></tr></thead>
-        <tbody id="rows"><tr><td colspan="3">Veri bekleniyor…</td></tr></tbody>
+        <thead><tr><th>#</th><th>Zaman</th><th class="r">Sıcaklık (°C)</th><th class="r">Nem (%)</th></tr></thead>
+        <tbody id="rows"><tr><td colspan="4">Veri bekleniyor…</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -126,31 +136,47 @@
 <script>
 (function () {
   // ---- Yapılandırma ----
-  // ThingSpeak kanal numaranızı buraya yazın (veya sayfa adresine ?channel=123456 ekleyin).
-  var CHANNEL_ID = "3548578";
+  var CHANNEL_ID   = "3548578";
   var READ_API_KEY = "AKM54WNXNKF51W4Q";
-  var RESULTS = 100;
-  var INTERVAL_MS = 15000;
+  var RESULTS      = 200;     // grafikte ve min/maks hesabında kullanılan kayıt sayısı
+  var POLL_MS      = 5000;    // yeni veri kontrol aralığı (hafif "last.json" sorgusu)
+  var STALE_S      = 60;      // bu süreden eski veri = cihaz çevrimdışı uyarısı
 
   var qs = new URLSearchParams(window.location.search);
   if (qs.get("channel")) CHANNEL_ID = qs.get("channel");
 
+  var BASE = "https://api.thingspeak.com/channels/" + encodeURIComponent(CHANNEL_ID);
+  var KEY  = "api_key=" + encodeURIComponent(READ_API_KEY);
+
   var $ = function (id) { return document.getElementById(id); };
-  var fmt = function (v) { return v.toFixed(1); };
+  var f1 = function (v) { return isNaN(v) ? "—" : v.toFixed(1); };
+  var f0 = function (v) { return isNaN(v) ? "—" : v.toFixed(0); };
+
+  var feeds = [];     // { id, t: Date, temp, hum }
+  var total = 0;
+  var lastId = 0;
+  var loading = false;
 
   var chart = new Chart($("chart"), {
     type: "line",
-    data: { labels: [], datasets: [{
-      label: "Sıcaklık (°C)", data: [],
-      borderColor: "#168AAD", backgroundColor: "rgba(22,138,173,0.10)",
-      borderWidth: 2, pointRadius: 2, tension: 0.25, fill: true
-    }]},
+    data: { labels: [], datasets: [
+      { label: "Sıcaklık (°C)", data: [], yAxisID: "y",
+        borderColor: "#168AAD", backgroundColor: "rgba(22,138,173,0.10)",
+        borderWidth: 2, pointRadius: 1.5, tension: 0.25, spanGaps: true },
+      { label: "Nem (%)", data: [], yAxisID: "y1",
+        borderColor: "#14283F", backgroundColor: "rgba(20,40,63,0.08)",
+        borderWidth: 2, pointRadius: 1.5, tension: 0.25, spanGaps: true, borderDash: [5, 3] }
+    ]},
     options: {
       responsive: true, maintainAspectRatio: false, animation: false,
-      plugins: { legend: { display: false } },
+      interaction: { mode: "index", intersect: false },
+      plugins: { legend: { display: true, labels: { boxWidth: 14, color: "#14283F" } } },
       scales: {
-        x: { ticks: { maxTicksLimit: 6, maxRotation: 0, color: "#5B6B7D" }, grid: { display: false } },
-        y: { ticks: { color: "#5B6B7D" }, grid: { color: "#DCE3EC" } }
+        x:  { ticks: { maxTicksLimit: 6, maxRotation: 0, color: "#5B6B7D" }, grid: { display: false } },
+        y:  { position: "left",  title: { display: true, text: "°C", color: "#168AAD" },
+              ticks: { color: "#5B6B7D" }, grid: { color: "#DCE3EC" } },
+        y1: { position: "right", title: { display: true, text: "%", color: "#14283F" },
+              ticks: { color: "#5B6B7D" }, grid: { drawOnChartArea: false } }
       }
     }
   });
@@ -161,59 +187,120 @@
     el.className = isErr ? "err" : "";
   }
 
-  function render(json) {
-    var feeds = (json.feeds || []).map(function (f) {
-      return { t: new Date(f.created_at), v: parseFloat(f.field1) };
-    }).filter(function (f) { return !isNaN(f.v); });
+  function parseFeed(f) {
+    return {
+      id: parseInt(f.entry_id, 10),
+      t: new Date(f.created_at),
+      temp: parseFloat(f.field1),
+      hum: parseFloat(f.field2)
+    };
+  }
+  function valid(f) { return !isNaN(f.temp) || !isNaN(f.hum); }
 
+  function stat(key) {
+    var v = feeds.map(function (f) { return f[key]; }).filter(function (x) { return !isNaN(x); });
+    if (!v.length) return { min: NaN, max: NaN, last: NaN };
+    return { min: Math.min.apply(null, v), max: Math.max.apply(null, v), last: v[v.length - 1] };
+  }
+
+  function render() {
     if (!feeds.length) { setStatus("Kanalda geçerli veri yok.", true); return; }
 
-    var vals = feeds.map(function (f) { return f.v; });
-    var last = feeds[feeds.length - 1];
-
-    $("cur").textContent = fmt(last.v);
-    $("min").textContent = fmt(Math.min.apply(null, vals));
-    $("max").textContent = fmt(Math.max.apply(null, vals));
-    var total = json.channel && json.channel.last_entry_id ? json.channel.last_entry_id : feeds.length;
-    $("count").textContent = total;
+    var st = stat("temp"), sh = stat("hum");
+    $("cur").textContent  = f1(st.last);
+    $("min").textContent  = f1(st.min);
+    $("max").textContent  = f1(st.max);
+    $("hcur").textContent = f0(sh.last);
+    $("hmin").textContent = f0(sh.min);
+    $("hmax").textContent = f0(sh.max);
+    $("count").textContent = total || feeds.length;
+    $("rangeText").textContent = "Min/Maks: son " + feeds.length + " kayıt";
 
     chart.data.labels = feeds.map(function (f) {
-      return f.t.toLocaleTimeString("tr-TR", { hour: "2-digit", minute: "2-digit" });
+      return f.t.toLocaleTimeString("tr-TR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
     });
-    chart.data.datasets[0].data = vals;
-    chart.update();
+    chart.data.datasets[0].data = feeds.map(function (f) { return isNaN(f.temp) ? null : f.temp; });
+    chart.data.datasets[1].data = feeds.map(function (f) { return isNaN(f.hum) ? null : f.hum; });
+    chart.update("none");
 
     var tbody = $("rows");
     tbody.textContent = "";
-    feeds.slice(-5).reverse().forEach(function (f, i) {
+    feeds.slice(-5).reverse().forEach(function (f) {
       var tr = document.createElement("tr");
-      var c1 = document.createElement("td"); c1.className = "num"; c1.textContent = String(feeds.length - i);
-      var c2 = document.createElement("td"); c2.className = "num";
-      c2.textContent = f.t.toLocaleString("tr-TR");
-      var c3 = document.createElement("td"); c3.className = "num r"; c3.textContent = fmt(f.v);
-      tr.appendChild(c1); tr.appendChild(c2); tr.appendChild(c3);
+      var cells = [
+        [String(f.id), "num"],
+        [f.t.toLocaleString("tr-TR"), "num"],
+        [f1(f.temp), "num r"],
+        [f0(f.hum), "num r"]
+      ];
+      cells.forEach(function (c) {
+        var td = document.createElement("td");
+        td.className = c[1];
+        td.textContent = c[0];
+        tr.appendChild(td);
+      });
       tbody.appendChild(tr);
     });
 
-    setStatus("Canlı", false);
-    $("lastUpdate").textContent = "Son güncelleme: " + new Date().toLocaleTimeString("tr-TR");
+    setStatus("Canlı · " + (POLL_MS / 1000) + " sn'de bir kontrol", false);
+    tickAge();
   }
 
-  function load() {
-    if (!CHANNEL_ID || CHANNEL_ID === "YOUR_CHANNEL_ID") {
-      setStatus("Kanal numarası ayarlanmadı (CHANNEL_ID).", true);
-      return;
-    }
-    var url = "https://api.thingspeak.com/channels/" + encodeURIComponent(CHANNEL_ID) +
-      "/feeds.json?api_key=" + encodeURIComponent(READ_API_KEY) + "&results=" + RESULTS;
-    fetch(url)
+  function tickAge() {
+    if (!feeds.length) return;
+    var s = Math.max(0, Math.floor((Date.now() - feeds[feeds.length - 1].t.getTime()) / 1000));
+    $("age").textContent = s < 120 ? s + " sn" : Math.floor(s / 60) + " dk";
+    $("ageBox").className = "value num" + (s > STALE_S ? " warn" : "");
+  }
+
+  function fullLoad() {
+    if (loading) return Promise.resolve();
+    loading = true;
+    return fetch(BASE + "/feeds.json?" + KEY + "&results=" + RESULTS)
       .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
-      .then(render)
+      .then(function (json) {
+        feeds = (json.feeds || []).map(parseFeed).filter(valid);
+        var ch = json.channel || {};
+        total = ch.last_entry_id ? parseInt(ch.last_entry_id, 10) : feeds.length;
+        lastId = feeds.length ? feeds[feeds.length - 1].id : 0;
+        render();
+      })
+      .catch(function (e) { setStatus("Veri alınamadı: " + e.message, true); })
+      .then(function () { loading = false; });
+  }
+
+  // Hafif sorgu: yalnızca son kaydı çeker, yenisi varsa listeye ekler.
+  function poll() {
+    if (loading || document.hidden) return;
+    fetch(BASE + "/feeds/last.json?" + KEY)
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function (obj) {
+        if (!obj || !obj.entry_id) return;
+        var id = parseInt(obj.entry_id, 10);
+        if (id <= lastId) { tickAge(); return; }
+        if (id === lastId + 1 || lastId === 0) {
+          var f = parseFeed(obj);
+          lastId = id;
+          total = id;
+          if (valid(f)) {
+            feeds.push(f);
+            if (feeds.length > RESULTS) feeds.shift();
+          }
+          render();
+        } else {
+          return fullLoad();   // birden fazla kayıt kaçırıldıysa baştan yükle
+        }
+      })
       .catch(function (e) { setStatus("Veri alınamadı: " + e.message, true); });
   }
 
-  load();
-  setInterval(load, INTERVAL_MS);
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden) fullLoad();   // sekmeye dönünce hemen güncelle
+  });
+
+  fullLoad();
+  setInterval(poll, POLL_MS);
+  setInterval(tickAge, 1000);
 })();
 </script>
 </body>
